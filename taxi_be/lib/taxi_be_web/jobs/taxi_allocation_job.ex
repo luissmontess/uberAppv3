@@ -1,5 +1,17 @@
 defmodule TaxiBeWeb.TaxiAllocationJob do
   use GenServer
+  # el conductor siempre llegara al minuto del accept por parte el mismo, esto para evitar tiempos largos
+  #  de pruebas
+  
+  # los conductores tienen 30 segundos para aceptar request del cliente
+
+  # mientras no hayan pasado los 30 segundos y un conductor no haya aceptado,
+  # el cliente puede cancelar sin tarifa
+
+  # si un conductor ya acepto, el cliente tiene 30 segundos para cancelar sin tarifa
+  # de lo contrario se le enviara mensaje de que una tarifa se cobro
+
+  # en el momento que el cliente cancela tambien se le manda la notificacion al conductor que acepto
 
   def start_link(request, name) do
     GenServer.start_link(__MODULE__, request, name: name)
@@ -12,6 +24,8 @@ defmodule TaxiBeWeb.TaxiAllocationJob do
       "booking_id" => bookingId
     } = request
     TaxiBeWeb.Endpoint.broadcast("customer:" <> customer, "booking_id", %{msg: "channel for id", bookingId: bookingId})
+
+    # iniciar estado con cada situacion
     {:ok, %{
       request: request,
       status: NotAccepted,
@@ -23,49 +37,60 @@ defmodule TaxiBeWeb.TaxiAllocationJob do
 
   def handle_info(:step1, %{request: request} = state) do
 
-    # send customer ride fare
+    # contactar cliente
     task = Task.async(fn ->
       compute_ride_fare(request)
       |> notify_customer_ride_fare()
     end)
     Task.await(task)
 
-    # get all taxis
+    # obtener todos los taxis
     taxis = select_candidate_taxis(request)
 
     %{"booking_id" => booking_id} = request
 
-    # send out requests to all taxis
+    # enviar request a cada taxi
     Enum.map(taxis, fn taxi -> TaxiBeWeb.Endpoint.broadcast("driver:" <> taxi.nickname, "booking_request", %{msg: "viaje disponible", bookingId: booking_id}) end)
 
-    Process.send_after(self(), :timelimit, 40000)
+    # enviar llamar funcion de limite de tiempo en un minuto
+    Process.send_after(self(), :timelimit, 30000)
     {:noreply, state}
   end
 
-  def handle_info(:timelimit, %{request: request, status: NotAccepted} = state) do
+  # limite de tiempo, status: NotAccepted
+  def handle_info(:timelimit, %{request: request, status: NotAccepted, cancelled: NotCancelled} = state) do
+    # Enviar mensaje de problema a cliente
     %{"username" => customer} = request
     TaxiBeWeb.Endpoint.broadcast("customer:" <> customer, "booking_request", %{msg: "A problem looking for a driver has arisen"})
+
+    # editar estado para tiempo excedido
     {:noreply, %{state | time: Exceeded}}
   end
 
+  # limite de tiempo, status: Accepted
   def handle_info(:timelimit, %{status: Accepted} = state) do
-
+    # solo editar estado para reflejar tiempo excedido
     {:noreply, %{state | time: Exceeded}}
   end
 
-  def handle_info(:timelimit, %{cancelled: IsCancelled} = state) do
-
+  # limite de tiempo, status: Accepted
+  def handle_info(:timelimit, %{cancelled: IsCancelled, status: NotAccepted} = state) do
+    # solo editar estado para reflejar tiempo excedido
     {:noreply, %{state | time: Exceeded}}
   end
 
+  # editar estado para reflejar que la cancelacion agregara una tarifa
   def handle_info(:cancelbad, state) do
-    # modify state to add tariff in case of cancellation
+    # enviar mensaje de tarifa y modificar estado
     {:noreply, %{state | cancelstatus: Tariff}}
   end
 
+  #  handles para llegada de conductor, casos cancelled y notcancelled
   def handle_info(:driverarrived, %{request: request, cancelled: NotCancelled} = state) do
     %{"username" => customer} = request
-    TaxiBeWeb.Endpoint.broadcast("customer:" <> customer, "booking_request", %{msg: "Your taxi has arrived"})
+    %{:driver => driver} = state
+    TaxiBeWeb.Endpoint.broadcast("customer:" <> customer, "driver_arrival", %{msg: "Your taxi has arrived"})
+    TaxiBeWeb.Endpoint.broadcast("driver:" <> driver, "booking_notification", %{msg: "You have arrived"})
     {:noreply, state}
   end
 
@@ -73,12 +98,10 @@ defmodule TaxiBeWeb.TaxiAllocationJob do
     {:noreply, state}
   end
 
-  # this is the accept function that actually links a taxi to the booking request
-  # when NOT ACCEPTED and TIME GOOD
-
+  # accept en caso de buen tiempo, no cancelado y no aun aceptado
   def handle_cast({:process_accept, driver_username}, %{request: request, status: NotAccepted, time: Good, cancelled: NotCancelled} = state) do
     # send out eventual arrival
-    Process.send_after(self(), :driverarrived, 40000)
+    Process.send_after(self(), :driverarrived, 60000)
 
     # notify customer that driver is on the way
     %{"username" => customer} = request
@@ -86,25 +109,29 @@ defmodule TaxiBeWeb.TaxiAllocationJob do
     taxi = getTaxi(driver_username, taxis)
     %{"pickup_address" => pickup_address} = request
     arrival = compute_estimated_arrival(pickup_address, taxi)
-    # IO.inspect(arrival/60)
 
     TaxiBeWeb.Endpoint.broadcast("customer:" <> customer, "booking_request", %{msg: "Driver #{driver_username} on the way, in #{round(Float.floor(arrival/60, 0))} minutes and #{rem(round(arrival), 60)} seconds"})
 
-    # prepare state for possible cancellation
-    Process.send_after(self(), :cancelbad, 20000)
+    # prepare state for possible cancellation, 20 seconds to respond
+    Process.send_after(self(), :cancelbad, 30000)
+    state = state |> Map.put(:driver, driver_username)
     {:noreply, %{state | status: Accepted}}
   end
 
   # When ACCEPTED
-
-  def handle_cast({:process_accept, driver_username}, %{status: Accepted} = state) do
+  def handle_cast({:process_accept, driver_username}, %{status: Accepted, cancelled: NotCancelled} = state) do
     TaxiBeWeb.Endpoint.broadcast("driver:" <> driver_username, "booking_notification", %{msg: "Already taken"})
     {:noreply, state}
   end
 
-  # NT ACCEPTED but TIME EXCEEDED
+  def handle_cast({:process_accept, driver_username}, %{status: Accepted, cancelled: IsCancelled} = state) do
+    TaxiBeWeb.Endpoint.broadcast("driver:" <> driver_username, "booking_notification", %{msg: "User cancelled"})
+    {:noreply, state}
+  end
+
+  # NOT ACCEPTED but TIME EXCEEDED
   def handle_cast({:process_accept, driver_username}, %{time: Exceeded} = state) do
-    TaxiBeWeb.Endpoint.broadcast("driver:" <> driver_username, "booking_notification", %{msg: "Too late homie"})
+    TaxiBeWeb.Endpoint.broadcast("driver:" <> driver_username, "booking_notification", %{msg: "Aceptacion muy tarde"})
     {:noreply, state}
   end
 
@@ -114,24 +141,38 @@ defmodule TaxiBeWeb.TaxiAllocationJob do
     {:noreply, state}
   end
 
+  # en caso de rechazo, solo regresar estado
   def handle_cast({:process_reject, driver_username}, state) do
     {:noreply, state}
   end
 
   # cancel cast if cancelling is permitted
-  def handle_cast({:process_cancel, customer_username}, %{request: request, cancelstatus: Permitted} = state) do
+  def handle_cast({:process_cancel, customer_username}, %{request: request, cancelstatus: Permitted, status: NotAccepted} = state) do
     IO.inspect(state)
-    TaxiBeWeb.Endpoint.broadcast("customer:" <> customer_username, "booking_request", %{msg: "Cancelled successfully"})
+    TaxiBeWeb.Endpoint.broadcast("customer:" <> customer_username, "driver_arrival", %{msg: "Cancelled successfully"})
 
+    {:noreply, %{state | cancelled: IsCancelled}}
+  end
+
+  def handle_cast({:process_cancel, customer_username}, %{request: request, cancelstatus: Permitted, status: Accepted} = state) do
+    IO.inspect(state)
+
+    %{:driver => driver} = state
+    TaxiBeWeb.Endpoint.broadcast("customer:" <> customer_username, "driver_arrival", %{msg: "Cancelled successfully"})
+    TaxiBeWeb.Endpoint.broadcast("driver:" <> driver, "booking_notification", %{msg: "user cancelled"})
     {:noreply, %{state | cancelled: IsCancelled}}
   end
 
   # cancel cast if cancelling is not permitted
   def handle_cast({:process_cancel, customer_username}, %{request: request, cancelstatus: Tariff} = state) do
-    TaxiBeWeb.Endpoint.broadcast("customer:" <> customer_username, "booking_request", %{msg: "A tariff will be added to your bill"})
-    {:noreply, state}
+    %{:driver => driver} = state
+    TaxiBeWeb.Endpoint.broadcast("customer:" <> customer_username, "driver_arrival", %{msg: "Late cancelation charge: $1,000,000"})
+    TaxiBeWeb.Endpoint.broadcast("driver:" <> driver, "booking_notification", %{msg: "user cancelled, tip was charged"})
+    {:noreply, %{state | cancelled: IsCancelled}}
   end
 
+
+  #funciones auxiliares
   def compute_ride_fare(request) do
     %{
       "pickup_address" => pickup_address,
